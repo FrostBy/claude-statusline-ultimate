@@ -358,7 +358,7 @@ test('Codex compacted records in the same file replace older context for seeds a
   }
 });
 
-test('large snapshots and single large deltas fit each client cap, acknowledge all chunks and terminate', async t => {
+test('Claude sends one block with preview ACK; Codex keeps acknowledged chunks', async t => {
   const { LIMITS } = require('../src/sync/delivery');
   for (const target of ['claude', 'codex']) {
     const f = await fixture(t);
@@ -375,28 +375,50 @@ test('large snapshots and single large deltas fit each client cap, acknowledge a
     while (output) {
       const text = output.hookSpecificOutput.additionalContext;
       assert(text.startsWith('[session-sync:v2:'));
-      assert(Buffer.byteLength(text) <= LIMITS[target]); assert(text.length <= (target === 'claude' ? 10000 : 64000));
+      assert(Buffer.byteLength(text) <= Math.min(LIMITS[target], f.config.contextTokens * 4));
+      if (target === 'claude') {
+        assert(text.length > 10000);
+        assert.equal((text.match(/\[session-sync:v2:/g) || []).length, 1);
+        assert.match(text.slice(0, 2000), /^\[session-sync:v2:[a-f0-9]{64}\]\nFull paired-session context follows; if this is a preview, read the saved file path given by Claude Code before answering/);
+        assert.match(text.slice(0, 2000), /Latest paired-session messages[\s\S]*FRESH-END/, 'preview must carry the newest messages');
+      }
       assert(!text.includes('\uFFFD')); joined += text;
       assert.deepEqual(await hook(target, input, f.config, opts), output, 'unacknowledged chunk must retry unchanged');
-      await f.append(p[target].file, target === 'claude' ? [c(p[target].id, text, { isMeta: true })]
+      await f.append(p[target].file, target === 'claude' ? [c(p[target].id, text.slice(0, 2000), { isMeta: true })]
         : [{ type: 'response_item', payload: { type: 'message', role: 'developer', content: [{ type: 'input_text', text }] } }]);
       output = await hook(target, input, f.config, opts);
       assert(++chunks < 40, 'snapshot must finish rather than loop');
     }
-    assert(chunks > 1); assert.match(joined, /SUMMARY-BEGIN/); assert.match(joined, /FRESH-END/);
+    assert(target === 'claude' ? chunks === 1 : chunks > 1); assert.match(joined, /SUMMARY-BEGIN/); assert.match(joined, /FRESH-END/);
     assert.equal((await f.pair())[target].snapshot, null);
+    assert.equal(await hook(target, input, f.config, opts), null);
     // A delta can exceed the per-hook cap while remaining below the active-context budget.
     const delta = 'DELTA-BEGIN ' + 'a'.repeat(90000) + ' DELTA-END';
-    await f.append(source.file, target === 'codex' ? [c(source.id, delta)] : [x(delta)]);
+    await f.append(source.file, target === 'codex' ? [c(source.id, delta), c(source.id, 'LAST-PENDING')]
+      : [x(delta), x('LAST-PENDING')]);
     output = await hook(target, input, f.config, opts); joined = ''; chunks = 0;
     while (output) {
       const text = output.hookSpecificOutput.additionalContext; assert(Buffer.byteLength(text) <= LIMITS[target]); joined += text;
-      await f.append(p[target].file, target === 'claude' ? [c(p[target].id, text, { isMeta: true })]
+      if (target === 'claude') { assert.equal((text.match(/\[session-sync:v2:/g) || []).length, 1); assert.match(text.slice(0, 2000), /LAST-PENDING/); }
+      await f.append(p[target].file, target === 'claude' ? [c(p[target].id, text.slice(0, 2000), { isMeta: true })]
         : [{ type: 'response_item', payload: { type: 'message', role: 'developer', content: [{ type: 'input_text', text }] } }]);
       output = await hook(target, input, f.config, opts); assert(++chunks < 25);
     }
-    assert(chunks > 1); assert.match(joined, /DELTA-BEGIN/); assert.match(joined, /DELTA-END/);
+    assert(target === 'claude' ? chunks === 1 : chunks > 1);
+    assert.match(joined, /DELTA-BEGIN/); assert.match(joined, /DELTA-END/); assert.match(joined, /LAST-PENDING/);
+    assert.equal((await f.pair())[target].pending.length, 0);
+    assert.equal(await hook(target, input, f.config, opts), null);
   }
+});
+
+test('claude delivery with a stale snapshot position restarts from the beginning of the text', async t => {
+  const { output } = require('../src/sync/delivery');
+  const text = 'SNAP-BEGIN ' + 'x'.repeat(30000) + ' SNAP-END';
+  const context = { materialize: async () => [{ origin: 'sync', role: 'user', text }], render: entries => entries.map(e => e.text).join('\n') };
+  const endpoint = { snapshot: { key: 'snap', position: 12000, budget: 200000 }, pending: [], inflight: [] };
+  const result = await output('claude', endpoint, 'unused.journal', 200000, context);
+  assert.match(result, /SNAP-BEGIN/); assert.match(result, /SNAP-END/);
+  assert.doesNotMatch(result, /�/);
 });
 
 test('busy locks exit silently; stale locks recover and an old owner cannot remove a newer lease', async t => {

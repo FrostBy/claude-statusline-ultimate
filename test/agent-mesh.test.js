@@ -186,6 +186,55 @@ test('idle and normal exits stay in events without waking Claude; errors and une
   assert.equal(fs.readFileSync(`${base}.events.jsonl`, 'utf8').trim().split('\n').length, count);
 });
 
+test('SessionStart quietly retires old dead brokers; a death after it wakes Stop once', async t => {
+  const tmp = fixture(t), input = { session_id: 'old-death', cwd: tmp, hook_event_name: 'SessionStart' };
+  const dir = scratchpad(input, tmp); fs.mkdirSync(dir, { recursive: true });
+  const old = new Date(Date.now() - 86400000);
+  for (const metadata of [{}, { lastTurnAt: old.toISOString() }, { updatedAt: old.toISOString() }]) {
+    const name = `old-${Object.keys(metadata)[0] || 'mtime'}`, file = path.join(dir, `${name}.state.json`);
+    fs.writeFileSync(file, JSON.stringify({ pid: 999999999, status: 'running', ...metadata }));
+    fs.utimesSync(file, old, old);
+  }
+  // A death event an older hook already recorded is retired too.
+  fs.writeFileSync(path.join(dir, 'recorded.state.json'), JSON.stringify({ pid: 999999998, status: 'done' }));
+  fs.writeFileSync(path.join(dir, 'recorded.events.jsonl'), JSON.stringify({ v: 1, id: 'recorded:1', seq: 1, at: old.toISOString(), from: 'recorded',
+    type: 'agent.exited', summary: 'Broker process died unexpectedly', payload: { reason: 'unexpected', pid: 999999998 } }) + '\n');
+  const options = { tmp, env: {}, ...short, write() { assert.fail('Old broker must not wake Claude'); } };
+  assert.equal(await hook(input, options), 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, '.mesh-events.cursor.json'), 'utf8'))['recorded.events.jsonl'], 1);
+  for (const file of fs.readdirSync(dir).filter(f => f.endsWith('.state.json'))) {
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, file))).status, 'done');
+  }
+  assert.deepEqual(fs.readdirSync(dir).filter(f => f.endsWith('.events.jsonl')), ['recorded.events.jsonl']);
+  assert.equal(await hook({ ...input, hook_event_name: 'Stop' }, options), 0);
+
+  const file = path.join(dir, 'fresh.state.json');
+  fs.writeFileSync(file, JSON.stringify({ pid: 999999999, status: 'running', lastTurnAt: old.toISOString() }));
+  // Make the fresh state unambiguously newer than SessionStart even on coarse filesystems.
+  const fresh = new Date(Date.now() + 1000); fs.utimesSync(file, fresh, fresh);
+  const writes = [];
+  assert.equal(await hook({ ...input, hook_event_name: 'Stop' }, { ...options, write: text => writes.push(text) }), 2);
+  assert.match(writes[0], /agent.exited.*unexpectedly/);
+  assert.equal(await hook({ ...input, hook_event_name: 'Stop' }, options), 0);
+});
+
+test('a broker observed alive before a waiter returns still wakes on death between hooks', async t => {
+  const tmp = fixture(t), input = { session_id: 'between-hooks', cwd: tmp, hook_event_name: 'SessionStart' };
+  const dir = scratchpad(input, tmp); fs.mkdirSync(dir, { recursive: true });
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+  t.after(() => child.kill());
+  const file = path.join(dir, 'worker.state.json');
+  fs.writeFileSync(file, JSON.stringify({ pid: child.pid, status: 'idle' }));
+  const old = new Date(Date.now() - 86400000); fs.utimesSync(file, old, old);
+  const options = { tmp, env: {}, ...short, write() {} };
+  assert.equal(await hook(input, options), 2);
+  const exited = new Promise(resolve => child.once('exit', resolve)); child.kill(); await exited;
+  const writes = [];
+  assert.equal(await hook({ ...input, hook_event_name: 'Stop' }, { ...options, write: text => writes.push(text) }), 2);
+  assert.match(writes[0], /agent.exited.*unexpectedly/);
+  assert.equal(await hook({ ...input, hook_event_name: 'Stop' }, options), 0);
+});
+
 test('SessionEnd queues exit only for live brokers in this scratchpad and its child directories', async t => {
   const tmp = fixture(t), input = { session_id: 'ending', cwd: tmp, hook_event_name: 'SessionEnd' }, dir = scratchpad(input, tmp);
   const nested = path.join(dir, 'agents'); fs.mkdirSync(nested, { recursive: true });

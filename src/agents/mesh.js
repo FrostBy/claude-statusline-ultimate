@@ -110,30 +110,58 @@ function brokerStates(dir) {
 function hasLiveBroker(dir) {
   return brokerStates(dir).some(state => state.unreadable || (!['done', 'error'].includes(state.status) && alive(state.pid)));
 }
-function detectDeaths(dir) {
+function detectDeaths(dir, since = cursor(dir).sessionStartedAt ?? Date.now(), observed = new Set()) {
   for (const state of brokerStates(dir)) {
-    if (['done', 'error'].includes(state.status) || !state.pid || alive(state.pid)) continue;
+    if (['done', 'error'].includes(state.status) || !state.pid) continue;
+    const identity = `${state.base}:${state.pid}`;
+    if (alive(state.pid)) { observed.add(identity); continue; }
+    const file = `${state.base}.state.json`;
+    const activity = Math.max(Number(new Date(state.lastTurnAt || 0)) || 0,
+      Number(new Date(state.updatedAt || 0)) || 0, fs.statSync(file).mtimeMs);
+    if (!observed.has(identity) && activity < since) {
+      const { base, ...stored } = state;
+      fs.writeFileSync(file, JSON.stringify({ ...stored, status: 'done' }), { mode: 0o600 });
+      continue;
+    }
     const events = readEvents(`${state.base}.events.jsonl`);
     if (events.some(e => e.type === 'agent.exited' && e.payload?.pid === state.pid)) continue;
     eventWriter(state.base, path.basename(state.base))('agent.exited', { reason: 'unexpected', pid: state.pid }, { summary: 'Broker process died unexpectedly' });
   }
 }
-async function nextEvent(dir, { timeoutMin = 120, pollMs = 250, signal, wakeOnly = false } = {}) {
+async function nextEvent(dir, { timeoutMin = 120, pollMs = 250, signal, wakeOnly = false, sessionStartedAt } = {}) {
   if (!Number.isFinite(timeoutMin) || timeoutMin <= 0 || !Number.isFinite(pollMs) || pollMs <= 0) throw Error('Invalid events timeout/poll interval');
   const release = lock(dir), deadline = Date.now() + timeoutMin * 60000;
   try {
+    if (sessionStartedAt !== undefined) updateCursor(dir, seen => { seen.sessionStartedAt = sessionStartedAt; seen.liveBrokers = []; });
+    const previous = cursor(dir), since = sessionStartedAt ?? previous.sessionStartedAt ?? Date.now();
+    const observed = new Set(previous.liveBrokers || []);
     for (;;) {
-      if (wakeOnly) detectDeaths(dir);
+      if (wakeOnly) {
+        const count = observed.size;
+        detectDeaths(dir, since, observed);
+        if (observed.size !== count) updateCursor(dir, seen => { seen.liveBrokers = [...observed]; });
+      }
       else signal?.throwIfAborted();
-      const seen = cursor(dir), candidates = [];
+      const seen = cursor(dir), candidates = [], retired = {};
       for (const file of eventFiles(dir)) {
         const events = readEvents(path.join(dir, file));
         const resolved = new Set(events.filter(e => e.type === 'request.resolved').map(e => e.requestId));
-        const next = events.find(e => e.seq > (seen[file] || 0) && !seen.delivered?.includes(e.id) && wakeTypes.has(e.type) &&
-          (!wakeOnly || e.type !== 'agent.exited' || ['error', 'unexpected'].includes(e.payload?.reason) || e.payload?.status === 'error' || e.payload?.code > 0) &&
-          !(['question', 'approval'].includes(e.type) && resolved.has(e.requestId)));
+        const base = path.join(dir, file.slice(0, -'.events.jsonl'.length));
+        // A death recorded before this session, of a broker it never saw alive, is history, not news.
+        const stale = e => wakeOnly && e.type === 'agent.exited' && e.payload?.reason === 'unexpected' &&
+          Number(new Date(e.at)) < since && !observed.has(`${base}:${e.payload?.pid}`);
+        const next = events.find(e => {
+          if (!(e.seq > (seen[file] || 0) && !seen.delivered?.includes(e.id) && wakeTypes.has(e.type) &&
+            (!wakeOnly || e.type !== 'agent.exited' || ['error', 'unexpected'].includes(e.payload?.reason) || e.payload?.status === 'error' || e.payload?.code > 0) &&
+            !(['question', 'approval'].includes(e.type) && resolved.has(e.requestId)))) return false;
+          if (stale(e)) { retired[file] = e.seq; return false; }
+          return true;
+        });
         if (next) candidates.push({ ...next, file });
       }
+      if (Object.keys(retired).length) updateCursor(dir, current => {
+        for (const [file, seq] of Object.entries(retired)) current[file] = Math.max(current[file] || 0, seq);
+      });
       candidates.sort((a, b) => a.at.localeCompare(b.at) || a.id.localeCompare(b.id));
       if (candidates.length) {
         const event = candidates[0];
